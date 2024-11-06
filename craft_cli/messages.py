@@ -30,6 +30,7 @@ import logging
 import os
 import pathlib
 import select
+import socket
 import sys
 import threading
 import traceback
@@ -79,6 +80,41 @@ _MSG_PROGRESS_PERMANENT = "<P>"
 _MSG_PROGRESS = "<p>"
 _MSG_ERROR = "<E>"
 _MSG_STREAM = "<S>"
+
+_EMITTER_SOCKET = ".craft_cli.socket"
+_EMITTER_MAX_MSG_SIZE = 0xffff
+
+
+class _EmitterServer:
+    def __init__(self) -> None:
+        os.unlink(_EMITTER_SOCKET)
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._socket.bind(_EMITTER_SOCKET)
+
+    def listen(self) -> None:
+        self._socket.listen(1)
+
+    def accept(self) -> socket.socket:
+        conn, _ = self._socket.accept()
+        return conn
+
+    def close(self) -> None:
+        self._socket.shutdown(socket.SHUT_RDWR)
+        self._socket.close()
+
+
+class _EmitterClient:
+    def __init__(self) -> None:
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    def connect(self) -> None:
+        self._socket.connect(_EMITTER_SOCKET)
+
+    def send(self, data: bytes) -> None:
+        self._socket.sendall(data)
+
+    def close(self) -> None:
+        self._socket.close()
 
 
 class _ErrorMessage(BaseErrorData):
@@ -263,6 +299,40 @@ class _Progresser:
         )
 
 
+class _MessageServerThread(threading.Thread):
+    """A thread that listens for remote messages and emits them locally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stop_flag = False
+        self._server = _EmitterServer()
+
+    def stop(self) -> None:
+        self._stop_flag = True
+        self._server.close()
+        self.join()
+
+    def run(self) -> None:
+        self._server.listen()
+        conn = self._server.accept()
+
+        while not self._stop_flag:
+            data = conn.recv(8)
+            if len(data) == 0:
+                break
+            if data[5] != ord('<') or data[7] != ord('>'):
+                raise RuntimeError("error in emitter message protocol")
+
+            size = int(str(data[:5], "utf-8"), 16)
+            msg_type = data[5:].decode("utf-8")
+
+            data = conn.recv(size)
+            text = data.decode("utf-8")
+            emit.handle_message(msg_type, text)
+
+        # emitter socket connection closed
+
+
 class _PipeReaderThread(threading.Thread):
     """A thread that reads bytes from a pipe and write lines to the Printer.
 
@@ -279,7 +349,7 @@ class _PipeReaderThread(threading.Thread):
     UNBLOCK_BYTE = b"\x00"
 
     def __init__(
-        self, printer: Printer, stream: TextIO | None, printer_flags: dict[str, bool]
+        self, printer: Printer, stream: TextIO | None, printer_flags: dict[str, bool],
     ) -> None:
         super().__init__()
         self.printer_flags = printer_flags
@@ -341,8 +411,12 @@ class _PipeReaderThread(threading.Thread):
 
             self.handle_message(_MSG_STREAM, text)
 
-    def handle_message(self, _msg_type: str, text: str) -> None:
+    def handle_message(self, msg_type: str, text: str) -> None:
         """Process emitted message according to the local system configuration."""
+        if emit.client:
+            _send_message(msg_type, text, emit.client)
+            return
+
         self.printer.show(self.stream, text, **self.printer_flags)
 
     def _run_posix(self) -> None:
@@ -564,6 +638,7 @@ class Emitter:
         *,
         streaming_brief: bool = False,
         docs_base_url: str | None = None,
+        is_client: bool = False,
     ) -> None:
         """Initialize the emitter; this must be called once and before emitting any messages.
 
@@ -596,9 +671,19 @@ class Emitter:
         self._log_handler = _Handler(self._printer, streaming_brief=streaming_brief)
         logger.addHandler(self._log_handler)
 
+        # create communication socket
+        if is_client:
+            self.client = _EmitterClient()
+            self.client.connect()
+        else:
+            self.client = None
+            self._emit_server_thread = _MessageServerThread()
+            self._emit_server_thread.start()
+
         self._initiated = True
         self._stopped = False
         self.set_mode(mode)
+
 
     @_active_guard()
     def get_mode(self) -> EmitterMode:
@@ -623,11 +708,6 @@ class Emitter:
                 self._printer.show(
                     sys.stderr, msg, use_timestamp=use_timestamp, avoid_logging=True, end_line=True
                 )
-
-    @_active_guard()
-    def stream(self, text: str) -> None:
-        """Show strings streamed from a stream context."""
-        self.handle_message(_MSG_STREAM, text)
 
     @_active_guard()
     def message(self, text: str) -> None:
@@ -668,7 +748,7 @@ class Emitter:
         """
         self.handle_message(_MSG_TRACE, text)
 
-    def handle_message(  # noqa: PLR0912 (too many branches)
+    def handle_message(  # noqa: PLR0912, PLR0915
         self, msg_type: str, text: str
     ) -> None:
         """Process emitted message according to the local system configuration.
@@ -685,6 +765,10 @@ class Emitter:
 
         :param msg: The emitted message, in Craft CLI message protocol format.
         """
+        if self.client:
+            _send_message(msg_type, text, self.client)
+            return
+
         if msg_type == _MSG_STREAM:
             if self._mode == EmitterMode.QUIET:
                 # no third party stream
@@ -759,9 +843,6 @@ class Emitter:
                 # Clear the message prefix, as this error stands alone
                 self._printer.set_terminal_prefix("")
             self._report_error(_ErrorMessage.loads(text))
-
-        else:
-            raise RuntimeError("unknown message type '{msg_type}'")
 
     def _get_progress_params(
         self, permanent: bool  # noqa: FBT001 (boolean positional arg)
@@ -872,6 +953,9 @@ class Emitter:
         """Do all the stopping."""
         self._printer.stop()
         self._stopped = True
+        self._initiated = False
+        if self._emit_server_thread:
+            self._emit_server_thread.stop()
 
     @_active_guard(ignore_when_stopped=True)
     def ended_ok(self) -> None:
@@ -937,6 +1021,14 @@ class Emitter:
     def set_secrets(self, secrets: list[str]) -> None:
         """Set the list of strings that should be masked out in all output."""
         self._printer.set_secrets(secrets)
+
+
+def _send_message(msg_type: str, text: str, client: _EmitterClient) -> None:
+    if len(text) > _EMITTER_MAX_MSG_SIZE - 8:
+        text = text[:_EMITTER_MAX_MSG_SIZE - 8]
+    size = len(text)
+    msg = f"{size:05x}{msg_type}{text}"
+    client.send(msg.encode())
 
 
 # module-level instantiated Emitter; this is the instance all code shall use and Emitter

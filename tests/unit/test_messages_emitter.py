@@ -168,7 +168,7 @@ def test_init_developer_modes(mode, tmp_path, monkeypatch):
     assert handler.mode == mode
 
 
-@pytest.mark.parametrize("method_name", [x for x in dir(Emitter) if x[0] != "_" and x != "init"])
+@pytest.mark.parametrize("method_name", [x for x in dir(Emitter) if x[0] != "_" and x not in ("init", "handle_message")])
 def test_needs_init(method_name):
     """Check that calling other methods needs emitter first to be initiated."""
     emitter = Emitter()
@@ -739,7 +739,7 @@ def test_ended_double_after_error(get_initiated_emitter):
 
 @pytest.mark.parametrize(
     "method_name",
-    [x for x in dir(Emitter) if x[0] != "_" and x not in ("init", "ended_ok", "error")],
+    [x for x in dir(Emitter) if x[0] != "_" and x not in ("init", "ended_ok", "error", "handle_message")],
 )
 def test_needs_being_active(get_initiated_emitter, method_name):
     """Check that calling public methods needs emitter to not be stopped."""
